@@ -60,7 +60,6 @@ Bundle::Bundle(Context& ctx,
     : _context(ctx),
       _data_layout(std::move(data_layout)),
       _target_triple(std::move(triple)) {
-  ikos_assert_msg(!this->_target_triple.empty(), "empty target triple");
 }
 
 Bundle::~Bundle() = default;

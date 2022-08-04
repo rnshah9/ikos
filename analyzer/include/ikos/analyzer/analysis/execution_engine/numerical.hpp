@@ -257,6 +257,14 @@ public:
                        const MachineInt& alloc_size) {
     // Update pointer, lifetime and initial value for the memory location
     this->allocate_memory(ptr, addr, nullity, lifetime, init_val);
+    if (init_val == MemoryInitialValue::Uninitialized) {
+      // When the size of the allocation is known (like it is here)
+      // we mark the storage as uninitialized by assigning it
+      // the undefined value.
+      this->_inv.normal().mem_write(ptr,
+                                    ScalarLit::undefined(),
+                                    alloc_size);
+    }
 
     if (this->_opts.test(ExecutionEngine::UpdateAllocSizeVar)) {
       // Update allocation size var
@@ -1561,6 +1569,13 @@ public:
           this->_inv.set_normal_flow_to_bottom(); // undefined behavior
         } else {
           this->_inv.normal().int_assign(alloc_size_var, alloc_size_int);
+
+          // When the size of the allocation is known (like it is here)
+          // we mark the storage as uninitialized by assigning it
+          // the undefined value.
+          this->_inv.normal().mem_write(lhs.var(),
+                                        ScalarLit::undefined(),
+                                        alloc_size_int);
         }
       } else if (array_size.is_machine_int_var()) {
         this->_inv.normal().int_apply(IntBinaryOperator::MulNoWrap,

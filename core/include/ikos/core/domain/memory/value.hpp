@@ -53,6 +53,7 @@
 
 #include <type_traits>
 
+#include <ikos/core/support/cast.hpp>
 #include <ikos/core/domain/lifetime/abstract_domain.hpp>
 #include <ikos/core/domain/memory/abstract_domain.hpp>
 #include <ikos/core/domain/memory/value/cell_set.hpp>
@@ -1111,6 +1112,30 @@ private:
       if (cell == new_cell) {
         found = true;
       } else if (this->cell_overlap(cell, new_cell)) {
+        if (this->_scalar.uninit_is_uninitialized(cell)) {
+          // Make new uninitialized cells for the parts not covered
+          // by the new_cell.
+          IntInterval new_interval = this->cell_range(new_cell);
+          MachineInt new_lb = new_interval.lb();
+          MachineInt new_ub = new_interval.ub();
+          IntInterval un_interval = this->cell_range(cell);
+          MachineInt un_lb = un_interval.lb();
+          MachineInt un_ub = un_interval.ub();
+          if (un_lb < new_lb) {
+            MachineInt low_size = new_lb - un_lb;
+            VariableRef low_cell = this->make_cell(base, un_lb, low_size, sign);
+            this->_scalar.uninit_refine(low_cell, Uninitialized::uninitialized());
+            new_cells.add(low_cell);
+          }
+          if (new_ub < un_ub) {
+            MachineInt high_size = un_ub - new_ub;
+            auto one = MachineInt(1, high_size.bit_width(), Unsigned);
+            MachineInt high_lb = new_ub + one;
+            VariableRef high_cell = this->make_cell(base, high_lb, high_size, sign);
+            this->_scalar.uninit_refine(high_cell, Uninitialized::uninitialized());
+            new_cells.add(high_cell);
+          }
+        }
         this->_scalar.dynamic_forget(cell);
         new_cells.remove(cell);
       }
@@ -1162,17 +1187,66 @@ private:
     return updated_cells;
   }
 
+
+
+  /// \brief Detect whether the read bits are initialized, uninitialized,
+  /// for possibly uninitialized.
+  ikos::core::Uninitialized is_read_uninitialized(MemoryLocationRef base,
+                            const MachineInt& offset,
+                            const MachineInt& size) {
+    if (!size.fits<uint32_t>()) {
+      // The ZNumber infrastructure cannot handle shifts by
+      // more than the max 32-bit number, so give up in that case.
+      // and assume possibly uninitialized.
+      return ikos::core::Uninitialized::top();
+    }
+
+    // Use ZNumbers as bitvectors for bits [0,size) relative to the
+    // low bound of the read (i.e. offset).
+    ZNumber zoffset = offset.to_z_number();
+    ZNumber zsize = size.to_z_number();
+    ZNumber zupper = zoffset + zsize;
+    ZNumber read_mask = make_clipped_mask(zoffset, zsize, zoffset, zsize);
+
+    CellSetT cells = this->_cells.get(base);
+    ZNumber initialized_coverage = ZNumber(0);
+    ZNumber uninitialized_coverage = ZNumber(0);
+    for (VariableRef cell : cells) {
+      ZNumber other_offset = CellVariableTrait::offset(cell).to_z_number();
+      ZNumber other_size = CellVariableTrait::size(cell).to_z_number();
+      ZNumber cell_mask =
+          make_clipped_mask(other_offset, other_size, zoffset, zsize);
+      Uninitialized cell_uninit = this->uninit_to_uninitialized(cell);
+      if (cell_uninit == ikos::core::Uninitialized::initialized()) {
+        initialized_coverage |= cell_mask;
+      } else if (cell_uninit == ikos::core::Uninitialized::uninitialized()) {
+        uninitialized_coverage |= cell_mask;
+      }
+    }
+    if (read_mask == initialized_coverage) {
+      // The read bits are completely initialized
+      return ikos::core::Uninitialized::initialized();
+    } else if (read_mask == uninitialized_coverage) {
+      // The read bits are all uninitialized
+      return ikos::core::Uninitialized::uninitialized();
+    }
+    // The bits may or may not be initialized, so top.
+    return ikos::core::Uninitialized::top();
+  }
+
   /// \brief Create a new cell for a read
   VariableRef read_realize_single_cell(MemoryLocationRef base,
                                        const MachineInt& offset,
                                        const MachineInt& size,
                                        Signedness sign) {
+    ikos::core::Uninitialized addr_uninit =
+        is_read_uninitialized(base, offset, size);
+
     VariableRef new_cell = this->make_cell(base, offset, size, sign);
+    this->_scalar.uninit_refine(new_cell, addr_uninit);
     CellSetT cells = this->_cells.get(base);
     cells.add(new_cell);
     this->_cells.set(base, cells);
-
-    // TODO(marthaud): perform further reduction in case of partial overlaps
     return new_cell;
   }
 
@@ -1495,6 +1569,7 @@ public:
       bool first = true;
 
       for (MemoryLocationRef addr : addrs) {
+
         VariableRef cell =
             this->read_realize_single_cell(addr, offset, size, sign);
 
@@ -1540,10 +1615,6 @@ public:
 
       this->_scalar.pointer_refine(lhs.var(), pointer_set);
     }
-
-    // Reading uninitialized memory is an error
-    // Therefore, the result of a read is always initialized
-    this->_scalar.uninit_assert_initialized(lhs.var());
   }
 
   void mem_copy(VariableRef dest,
